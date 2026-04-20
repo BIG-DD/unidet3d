@@ -6,7 +6,7 @@ from .loading import LoadAnnotations3D_, NormalizePointsColor_, DenormalizePoint
 from .formatting import Pack3DDetInputs_
 from .transforms_3d import PointDetClassMappingScanNet
 from .data_preprocessor import Det3DDataPreprocessor_
-from .scannet_dataset import ScanNetSegDataset_, ScanNetDetDataset
+from .scannet_dataset import ScanNetSegDataset_, ScanNetDetDataset, CustomRGBDDetDataset
 from .s3dis_dataset import S3DISSegDetDataset
 from .arkitscenes_dataset import ARKitScenesOfflineDataset
 from .multiscan_dataset import MultiScan_

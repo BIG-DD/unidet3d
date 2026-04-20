@@ -1,0 +1,24 @@
+services:
+  unidet3d:
+    build: .
+    image: unidet3d:latest
+    container_name: unidet3d
+    working_dir: /workspace
+    environment:
+      - PYTHONPATH=/workspace
+    volumes:
+      # Mount project for live code editing
+      - .:/workspace
+      # Optional: mount data and work_dirs if they live outside the repo
+      # - /path/to/your/data:/workspace/data:ro
+      # - /path/to/your/work_dirs:/workspace/work_dirs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    stdin_open: true
+    tty: true
+    command: bash

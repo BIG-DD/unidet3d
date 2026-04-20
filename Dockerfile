@@ -23,7 +23,7 @@ RUN git clone https://github.com/open-mmlab/mmcv.git \
     && cd mmcv \
     && git reset --hard 780ffed9f3736fedadf18b51266ecbf521e64cf6 \
     && sed -i "s/'-std=c++14'] if cuda_args else/'-std=c++14', '-arch=sm_90'] if cuda_args else/g" setup.py \
-    && TORCH_CUDA_ARCH_LIST="6.1 7.0 8.6 9.0" \
+    && export TORCH_CUDA_ARCH_LIST="6.1 7.0 8.6 9.0" \
     && pip install -v -e . --no-deps \
     && cd ..
 
@@ -99,3 +99,9 @@ RUN pip install --no-deps \
     portalocker==2.8.2 \
     ftfy==6.2.0 \
     regex==2024.4.16
+
+WORKDIR /workspace
+ENV PYTHONPATH=/workspace:$PYTHONPATH
+# Copy project so image works without mount; mount overrides at runtime
+COPY . /workspace
+CMD ["bash"]

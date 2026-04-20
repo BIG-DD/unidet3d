@@ -1,4 +1,5 @@
 from os import path as osp
+from typing import Optional, Sequence
 import numpy as np
 import warnings
 
@@ -173,3 +174,47 @@ class ScanNetDetDataset(ScanNetSegDataset_):
             origin=(0.5, 0.5, 0.5))  # .convert_to(self.box_mode_3d)
 
         return ann_info
+
+
+@DATASETS.register_module()
+class CustomRGBDDetDataset(ScanNetDetDataset):
+    """任意类别的 RGB-D 检测数据集，不受 ScanNet 词表限制。
+
+    语义 mask 中类别 ID 应直接对应 metainfo['classes'] 的下标（0-based），
+    背景点用 -1 标记。
+    使用方法：在 config 中指定 metainfo=dict(classes=[...]) 即可。
+    """
+
+    # 提供一个空壳 METAINFO，避免继承 ScanNet 的类别限制
+    # 真正的 classes/palette 在运行时由 metainfo=dict(classes=...) 注入
+    METAINFO: dict = dict(
+        classes=(),
+        palette=(),
+        seg_valid_class_ids=(),
+        seg_all_class_ids=())
+
+    def get_label_mapping(self,
+                          new_classes: Optional[Sequence] = None) -> tuple:
+        """对自定义类别返回恒等映射，不做词表校验。"""
+        if new_classes is None:
+            new_classes = self.metainfo.get('classes', [])
+        n = len(new_classes)
+        label_mapping  = {i: i for i in range(n)}
+        label2cat      = {i: name for i, name in enumerate(new_classes)}
+        valid_class_ids = tuple(range(n))
+        return label_mapping, label2cat, valid_class_ids
+
+    def _update_palette(self, new_classes, palette):
+        """为自定义类别自动生成或透传调色板，不查 ScanNet 词表。"""
+        # 如果外部已提供足够颜色就直接用
+        if palette is not None and len(palette) >= len(new_classes):
+            return list(palette[:len(new_classes)])
+        # 自动生成循环颜色
+        default_colors = [
+            (106, 90,  205), (255, 165,  0),  (50,  205, 50),
+            (30, 144,  255), (220,  20,  60), (255, 215,  0),
+            (0,  128, 128),  (148,   0, 211), (255, 127,  80),
+            (135, 206, 235),
+        ]
+        return [default_colors[i % len(default_colors)]
+                for i in range(len(new_classes))]

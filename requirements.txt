@@ -1,0 +1,88 @@
+# UniDet3D Requirements
+# ──────────────────────────────────────────────────────────────────────────────
+# DO NOT install with `pip install -r requirements.txt` directly.
+# Some packages require specific install order and extra index URLs.
+# Follow the step-by-step guide in CUSTOM_TRAINING.md § "环境配置".
+#
+# Quick reference for versions used in development:
+#   Python       3.10
+#   CUDA driver  ≥ 12.1
+#   PyTorch      2.1.2+cu121
+#   spconv       2.3.6 (cu120)
+#   MinkowskiEngine  0.5.4 (built from source)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── Core deep learning ────────────────────────────────────────────────────────
+# Install via: pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2
+#              --index-url https://download.pytorch.org/whl/cu121
+torch==2.1.2
+torchvision==0.16.2
+torchaudio==2.1.2
+
+# ── OpenMMLab stack ───────────────────────────────────────────────────────────
+# Install via: pip install mmengine==0.9.0
+#              pip install mmcv==2.1.0 -f https://download.openmmlab.com/mmcv/dist/cu121/torch2.1/index.html
+#              pip install mmdet==3.3.0 mmsegmentation==1.2.0 mmpretrain==1.2.0
+#              pip install mmdet3d==1.4.0
+mmengine==0.9.0
+mmcv==2.1.0
+mmdet==3.3.0
+mmsegmentation==1.2.0
+mmpretrain==1.2.0
+mmdet3d==1.4.0
+
+# ── Sparse convolution ────────────────────────────────────────────────────────
+# CUDA 12.x: pip install spconv-cu120==2.3.6
+# CUDA 11.8: pip install spconv-cu118==2.3.6
+spconv-cu120==2.3.6
+
+# ── MinkowskiEngine (build from source) ──────────────────────────────────────
+# See CUSTOM_TRAINING.md for build instructions
+# pip install git+https://github.com/NVIDIA/MinkowskiEngine.git
+#   --install-option="--blas=openblas" --no-deps
+MinkowskiEngine==0.5.4
+
+# ── Sparse tensor scatter ─────────────────────────────────────────────────────
+# pip install torch-scatter -f https://data.pyg.org/whl/torch-2.1.2+cu121.html
+torch-scatter==2.1.2
+
+# ── Depth estimation (Depth Anything V2) ─────────────────────────────────────
+transformers==4.40.2
+timm==0.9.16
+huggingface_hub==0.36.2
+accelerate==1.13.0
+
+# ── Point cloud & 3D ─────────────────────────────────────────────────────────
+open3d==0.17.0
+trimesh==3.21.6
+plyfile==1.0.2
+
+# ── Vision & image processing ─────────────────────────────────────────────────
+opencv-python==4.7.0.72
+scikit-image==0.25.2
+pillow==12.1.1
+imageio==2.34.0
+
+# ── Numerical & scientific ────────────────────────────────────────────────────
+numpy==1.24.1
+scipy==1.15.3
+scikit-learn==1.2.2
+numba==0.57.0
+pandas==2.0.1
+
+# ── Visualization ─────────────────────────────────────────────────────────────
+matplotlib==3.5.2
+plotly==5.18.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+pycocotools==2.0.6
+nuscenes-devkit==1.1.10
+Shapely==1.8.5
+addict==2.4.0
+yapf==0.33.0
+termcolor==2.3.0
+rich==13.3.5
+tqdm==4.67.3
+pyyaml==6.0.3
+packaging==23.1
+psutil==7.2.2
