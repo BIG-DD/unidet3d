@@ -1,0 +1,58 @@
+# 自定义分割标签配置
+#
+# annotation_id : 标注平台 title 字段中的编号，如 "2.汽车" → 2
+# name_zh       : 中文标签名，与 JSON data[].label 字段严格匹配
+# name_en       : 英文类别名，用于模型训练（CLASS_NAMES 顺序即为 label id 顺序）
+# color_rgb     : 可视化颜色 [R, G, B]，取值范围 0-255
+# size_prior_m  : [dx, dy, dz] 典型物体尺寸（米），用于深度覆盖不足时的尺寸兜底
+#                 dx=横向, dy=竖向(向下为正), dz=深度方向
+#                 不填则使用默认值 [1.0, 1.0, 1.0]
+
+categories:
+  - annotation_id: 2
+    name_zh: 汽车
+    name_en: car
+    color_rgb: [255, 100, 50]
+    size_prior_m: [1.8, 1.5, 4.2]
+
+  - annotation_id: 3
+    name_zh: 汽车落地简介牌
+    name_en: car_sign
+    color_rgb: [255, 220, 0]
+    size_prior_m: [0.6, 1.2, 0.1]
+
+  - annotation_id: 4
+    name_zh: 桌子
+    name_en: table
+    color_rgb: [160, 100, 40]
+    size_prior_m: [1.2, 0.8, 0.8]
+
+  - annotation_id: 6
+    name_zh: 座椅
+    name_en: chair
+    color_rgb: [50, 210, 50]
+    size_prior_m: [0.6, 0.9, 0.6]
+
+  - annotation_id: 8
+    name_zh: 行人
+    name_en: person
+    color_rgb: [80, 160, 255]
+    size_prior_m: [0.5, 1.7, 0.4]
+
+  - annotation_id: 9
+    name_zh: 垃圾桶
+    name_en: trash_can
+    color_rgb: [150, 150, 150]
+    size_prior_m: [0.4, 0.7, 0.4]
+
+  - annotation_id: 11
+    name_zh: 杯子
+    name_en: cup
+    color_rgb: [0, 200, 200]
+    size_prior_m: [0.1, 0.12, 0.1]
+
+  - annotation_id: 12
+    name_zh: 饮料瓶子
+    name_en: bottle
+    color_rgb: [180, 80, 220]
+    size_prior_m: [0.08, 0.25, 0.08]
