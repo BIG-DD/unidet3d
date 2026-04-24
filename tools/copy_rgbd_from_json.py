@@ -3,7 +3,7 @@ import shutil
 from collections import defaultdict
 from pathlib import Path
 from typing import Tuple, Union
-
+import json
 
 def move_all_npy_to_dir(
     src_root: Union[str, Path],
@@ -37,7 +37,7 @@ def move_all_npy_to_dir(
     if not dry_run:
         dst_dir.mkdir(parents=True, exist_ok=True)
 
-    npy_files = sorted(src_root.rglob("*.npy"))
+    npy_files = sorted(src_root.rglob("*.jpg"))
     flat_name_count: defaultdict[str, int] = defaultdict(int)
 
     def unique_flat_name(basename: str) -> str:
@@ -74,32 +74,34 @@ def move_all_npy_to_dir(
     return moved, failed
 
 def copy_rgbd_from_json():
-    annotations_dir = r"D:\security\version-4\annotation"
-    annotations_list = os.listdir(annotations_dir)
-    jpg_dir = r"D:\security\version-4\images"
-    npy_dir = r"D:\security\version-4\depth"
-    output_dir = r"D:\security\version-4\images_save"
-    for annotation in annotations_list:
-        annotation_split_name = annotation.split("d2c_")[-1].split(".")[0]
-        jpg_path = os.path.join(jpg_dir, f"rgb_{annotation_split_name}.jpg")
-        npy_path = os.path.join(npy_dir, f"depth_{annotation_split_name}.npy")
-        if os.path.exists(jpg_path) and os.path.exists(npy_path):
-            shutil.copy(jpg_path, os.path.join(output_dir, f"rgb_{annotation_split_name}.jpg"))
-            shutil.copy(npy_path, os.path.join(output_dir, f"depth_{annotation_split_name}.npy"))
+    json_dir = r"E:\work\code\python\unidet3d\jpg_list.json"
+    # annotations_dir = r"D:\security\version-4\annotation"
+    # annotations_list = os.listdir(annotations_dir)
+    # jpg_dir = r"D:\security\version-4\images"
+    npy_dir = r"E:\work\data\changan_dataset\depth"
+    output_dir = r"E:\work\data\changan_dataset\out_depth"
+    with open(json_dir, "r") as f:
+        json_data = json.load(f)
+        for annotation in json_data:
+            annotation_split_name = annotation.split("d2c_")[-1].split(".")[0]
+            # jpg_path = os.path.join(jpg_dir, f"rgb_{annotation_split_name}.jpg")
+            npy_path = os.path.join(npy_dir, f"depth_d2c_{annotation_split_name}.npy")
+
+            shutil.copy(npy_path, os.path.join(output_dir, f"depth_d2c_{annotation_split_name}.npy"))
 
 def copy_rgbd_from_dir():
-    annotations_dir = r"D:\security\version-4\annotation"
+    annotations_dir = r"D:\security\annotation\images"
     annotations_list = os.listdir(annotations_dir)
-    jpg_dir = r"D:\security\version-4\images"
-    npy_dir = r"D:\security\version-4\depth"
-    output_dir = r"D:\security\version-4\images_save"
+    jpg_dir = r"E:\work\data\changan_dataset\jpg"
+    npy_dir = r"E:\work\data\changan_dataset\depth"
+    output_dir = r"D:\security\new_data\images"
     for annotation in annotations_list:
         annotation_split_name = annotation.split("d2c_")[-1].split(".")[0]
-        jpg_path = os.path.join(jpg_dir, f"rgb_{annotation_split_name}.jpg")
-        npy_path = os.path.join(npy_dir, f"depth_{annotation_split_name}.npy")
+        jpg_path = os.path.join(jpg_dir, f"rgb_d2c_{annotation_split_name}.jpg")
+        npy_path = os.path.join(npy_dir, f"depth_d2c_{annotation_split_name}.npy")
         if os.path.exists(jpg_path) and os.path.exists(npy_path):
-            shutil.copy(jpg_path, os.path.join(output_dir, f"rgb_{annotation_split_name}.jpg"))
-            shutil.copy(npy_path, os.path.join(output_dir, f"depth_{annotation_split_name}.npy"))
+            shutil.copy(jpg_path, os.path.join(output_dir, f"rgb_d2c_{annotation_split_name}.jpg"))
+            shutil.copy(npy_path, os.path.join(output_dir, f"depth_d2c_{annotation_split_name}.npy"))
 
 if __name__ == "__main__":
-    move_all_npy_to_dir(src_root=r"E:\work\data\changan_dataset\rename", dst_dir=r"E:\work\data\changan_dataset\depth")
+    copy_rgbd_from_dir()

@@ -2,9 +2,8 @@
 RGB-D + labelme polygon → UniDet3D 训练数据 + Open3D 可视化
 
 深度增强策略（三级）:
-  1. Depth Anything V2（DA2）神经网络估计稠密相对深度
-     → 最小二乘标定到传感器 metric 尺度（scale + shift）
-     → 与传感器深度加权融合（近处信任传感器，远处信任 DA2）
+  1. 深度补全（默认 ``guided_inpaint``：RGB 归一化深度图 TELEA 空洞填补 + 双边滤波，
+     无模型下载；可选 ``da2``：Depth Anything V2 + 最小二乘标定与加权融合）
   2. 飞点清理：mask 腐蚀 → 统计离群点 → DBSCAN 取最大簇 → 百分位裁剪
   3. 类别先验尺寸兜底：框尺寸异常时用先验约束
 
@@ -17,11 +16,16 @@ RGB-D + labelme polygon → UniDet3D 训练数据 + Open3D 可视化
         --out-dir    data/custom \
         --vis-dir    results/custom_vis
 
+    # 仅逐帧交互、不写训练 bin/pkl/默认可视化（可加 --no-da2）
+    python tools/prepare_custom_rgbd.py --data-dir /path/to/root \\
+        --interactive-only --no-da2
+
 文件匹配规则：以 --ann-dir 中每个 .json 的文件名主干（stem）为基准，
 分别在 --rgb-dir 中搜索同名的 .jpg/.jpeg/.png，在 --depth-dir 中搜索同名的 .npy。
 """
 
 import argparse, glob, json, os
+import sys
 import cv2
 import mmengine
 import numpy as np
@@ -43,7 +47,7 @@ CLASS_PRIORS     = {}   # {'car': np.array([dx,dy,dz])}
 def load_label_config(config_path: str):
     """从 YAML 配置文件加载类别信息，填充全局映射表。"""
     global CLASS_NAMES, NAME2ID, LABEL_MAP, CLASS_COLORS_RGB, CLASS_PRIORS
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     cats = cfg['categories']
     CLASS_NAMES = [c['name_en'] for c in cats]
@@ -70,62 +74,86 @@ EDGES = [(0,1),(0,2),(0,4),(1,3),(1,5),(2,3),(2,6),(3,7),
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Depth Anything V2 深度估计 + 传感器融合
+# 深度补全 / 融合（guided_inpaint 默认，可选 DA2）
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_depth_model(device='cuda:0'):
+
+def fuse_depth_guided_inpaint(sensor_mm, rgb, inpaint_radius=5):
+    """
+    非学习式稠密深度：将无效/空洞区域在归一化深度图上做 TELEA inpaint，
+    再双边滤波；有效传感器像素处高权重保留原测量并略混入平滑结果抑噪。
+    不依赖 torch / HuggingFace，适合离线批处理。
+    """
+    valid = (sensor_mm > DEPTH_MIN_MM) & (sensor_mm < DEPTH_MAX_MM)
+    if valid.sum() < 200:
+        return sensor_mm.copy()
+
+    z = np.clip(sensor_mm.astype(np.float64), DEPTH_MIN_MM, DEPTH_MAX_MM)
+    z_n = (z - DEPTH_MIN_MM) / (DEPTH_MAX_MM - DEPTH_MIN_MM + 1e-6)
+    z8 = (np.clip(z_n, 0.0, 1.0) * 255.0).astype(np.uint8)
+    mask = (~valid).astype(np.uint8) * 255
+
+    filled8 = cv2.inpaint(z8, mask, inpaint_radius, cv2.INPAINT_TELEA)
+    filled = filled8.astype(np.float64) / 255.0 * (DEPTH_MAX_MM - DEPTH_MIN_MM) + DEPTH_MIN_MM
+    filled = filled.astype(np.float32)
+
+    d_smooth = cv2.bilateralFilter(filled, d=9, sigmaColor=100.0, sigmaSpace=7)
+
+    sensor = sensor_mm.astype(np.float32)
+    beta = 0.12
+    out = np.where(valid, (1.0 - beta) * sensor + beta * d_smooth, d_smooth)
+    return np.clip(out, DEPTH_MIN_MM, DEPTH_MAX_MM).astype(np.float32)
+
+
+def load_depth_model_da2(device='cuda:0'):
     from transformers import AutoImageProcessor, AutoModelForDepthEstimation
     import torch
     print("加载 Depth Anything V2 Small ...")
-    proc  = AutoImageProcessor.from_pretrained(
+    proc = AutoImageProcessor.from_pretrained(
         'depth-anything/Depth-Anything-V2-Small-hf')
     model = AutoModelForDepthEstimation.from_pretrained(
         'depth-anything/Depth-Anything-V2-Small-hf').to(device).eval()
     print("  DA2 加载完成")
-    return proc, model
+    return {
+        'backend': 'da2',
+        'proc': proc,
+        'model': model,
+        'device': device,
+    }
 
 
-def fuse_depth(sensor_mm, rgb, proc, model, device='cuda:0'):
+def fuse_depth_da2(sensor_mm, rgb, proc, model, device='cuda:0'):
     """
     DA2 输出 affine-invariant 深度（可能是视差型，近处值大）。
-    标定流程：
-      1. 用传感器有效像素计算 DA2 与 sensor_m 的相关系数
-      2. 若负相关 → DA2 是视差，先取倒数 (1/da2) 再做线性标定
-      3. 若正相关 → DA2 是深度，直接线性标定
-      4. 加权融合：近处用传感器，远处用 DA2
+    标定 + 加权融合：近处信任传感器，远处信任 DA2。
     """
     from PIL import Image
     import torch
 
     H, W = sensor_mm.shape
-
-    # ── DA2 推理 ──────────────────────────────────────────────────────────────
     pil = Image.fromarray(rgb)
     inputs = proc(images=pil, return_tensors='pt').to(device)
     with torch.no_grad():
-        pred = model(**inputs).predicted_depth   # (1, H', W')
+        pred = model(**inputs).predicted_depth
     pred_np = pred.squeeze().cpu().float().numpy()
     pred_np = cv2.resize(pred_np, (W, H), interpolation=cv2.INTER_LINEAR)
 
     sensor_m = sensor_mm / 1000.0
-    valid    = (sensor_mm > DEPTH_MIN_MM) & (sensor_mm < DEPTH_MAX_MM)
+    valid = (sensor_mm > DEPTH_MIN_MM) & (sensor_mm < DEPTH_MAX_MM)
     if valid.sum() < 200:
         return sensor_mm.copy()
 
     s_raw = pred_np[valid].astype(np.float64)
-    d     = sensor_m[valid].astype(np.float64)
+    d = sensor_m[valid].astype(np.float64)
 
-    # ── 判断 DA2 是视差还是深度 ───────────────────────────────────────────────
     corr = float(np.corrcoef(s_raw, d)[0, 1])
     if corr < 0:
-        # 视差型：值越大 = 越近；取倒数转成"相对深度"
         s_calib = 1.0 / (s_raw + 1e-6)
         da2_for_calib = 1.0 / (pred_np.astype(np.float64) + 1e-6)
     else:
         s_calib = s_raw
         da2_for_calib = pred_np.astype(np.float64)
 
-    # ── 最小二乘：sensor_m = a * s_calib + b ─────────────────────────────────
     A = np.stack([s_calib, np.ones_like(s_calib)], axis=1)
     coef, _, _, _ = np.linalg.lstsq(A, d, rcond=None)
     a, b = float(coef[0]), float(coef[1])
@@ -135,16 +163,34 @@ def fuse_depth(sensor_mm, rgb, proc, model, device='cuda:0'):
 
     da2_metric_mm = (a * da2_for_calib + b) * 1000.0
 
-    # ── 加权融合：近处信任传感器，远处信任 DA2 ───────────────────────────────
     sensor_z_m = np.where(valid, sensor_m, 0.0)
-    w_sensor   = np.where(valid,
-                          np.clip(1.0 - (sensor_z_m - 1.0) / 7.0, 0.1, 0.9),
-                          0.0)
-    fused = np.where(valid,
-                     w_sensor * sensor_mm + (1 - w_sensor) * da2_metric_mm,
-                     da2_metric_mm)
-    fused = np.clip(fused, DEPTH_MIN_MM, DEPTH_MAX_MM).astype(np.float32)
-    return fused
+    w_sensor = np.where(
+        valid,
+        np.clip(1.0 - (sensor_z_m - 1.0) / 7.0, 0.1, 0.9),
+        0.0,
+    )
+    fused = np.where(
+        valid,
+        w_sensor * sensor_mm + (1 - w_sensor) * da2_metric_mm,
+        da2_metric_mm,
+    )
+    return np.clip(fused, DEPTH_MIN_MM, DEPTH_MAX_MM).astype(np.float32)
+
+
+def fuse_depth(sensor_mm, rgb, depth_proc):
+    """``depth_proc`` 为 ``{'backend': ...}``，由 ``main`` 构建。"""
+    bk = depth_proc['backend']
+    if bk == 'guided_inpaint':
+        return fuse_depth_guided_inpaint(sensor_mm, rgb)
+    if bk == 'da2':
+        return fuse_depth_da2(
+            sensor_mm,
+            rgb,
+            depth_proc['proc'],
+            depth_proc['model'],
+            device=depth_proc['device'],
+        )
+    raise ValueError(f"未知 depth backend: {bk}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -170,6 +216,22 @@ def depth_to_xyz(depth_mm, fx, fy, cx, cy):
                          np.arange(H, dtype=np.float32))
     z = depth_mm / 1000.0
     return np.stack([(uu - cx) * z / fx, (vv - cy) * z / fy, z], axis=-1)
+
+
+def tight_axis_aligned_bbox(pts3d, lo_pct=0.5, hi_pct=99.5):
+    """
+    与相机坐标轴对齐的紧 AABB（横平竖直）：中心为各轴 (min+max)/2，
+    尺寸为各轴跨度；用略窄分位去掉极少数飞点，使框贴合 mask 内有效深度点。
+    """
+    pts3d = np.asarray(pts3d, dtype=np.float64)
+    if len(pts3d) < 4:
+        mn, mx = pts3d.min(0), pts3d.max(0)
+    else:
+        mn = np.percentile(pts3d, lo_pct, axis=0)
+        mx = np.percentile(pts3d, hi_pct, axis=0)
+    s = np.maximum(mx - mn, 1e-3).astype(np.float64)
+    c = (mn + mx) / 2.0
+    return np.concatenate([c, s]).astype(np.float32)
 
 
 def _ground_anchored_center(mn, mx):
@@ -245,12 +307,18 @@ def prior_bbox(pts3d, poly_mask_2d, label, K):
     return np.array([x, y, z, dx, dy, dz], dtype=np.float32)
 
 
-def apply_prior_sanity(bbox, label):
-    """用先验尺寸约束框大小（最小×0.3，最大×3），防止仍然异常。"""
+def apply_prior_sanity(bbox, label, min_clip=True):
+    """
+    先验约束边长：``min_clip=True`` 时带上下限（稀疏深度）；``False`` 时只截上限，
+    避免把已贴合点云的框按先验下限撑大。
+    """
     prior = CLASS_PRIORS.get(label, np.array([1.0, 1.0, 1.0]))
     for i, p in enumerate(prior):
-        lo, hi = p * 0.25, p * 3.5
-        bbox[3 + i] = float(np.clip(bbox[3 + i], lo, hi))
+        hi = p * 3.5
+        bbox[3 + i] = float(min(bbox[3 + i], hi))
+        if min_clip:
+            lo = p * 0.25
+            bbox[3 + i] = float(max(bbox[3 + i], lo))
     return bbox
 
 
@@ -351,7 +419,7 @@ def parse_annotation(ann_path):
       [{'label': <英文类名>, 'points': [[x, y], ...]}, ...]
     仅保留 type=='polygon' 且标签在 LABEL_MAP 中的实例。
     """
-    with open(ann_path) as f:
+    with open(ann_path, encoding="utf-8") as f:
         raw = json.load(f)
     mark = raw['markData']
     shapes = []
@@ -372,23 +440,40 @@ def parse_annotation(ann_path):
 def process_frame(rgb_path, depth_path, ann_path, K,
                   scene_id, bins_dir, vis_dir,
                   erode_px=2, depth_proc=None,
-                  interactive=False, frame_info=''):
+                  interactive=False, frame_info='',
+                  vis_3d=True,
+                  write_training_data=True,
+                  interactive_snap_dir=None):
     """
-    depth_proc: (processor, model) 或 None（不使用 DA2）
+    depth_proc: ``{'backend': 'guided_inpaint'|'da2', ...}`` 或 None（不补全）
+    write_training_data: False 时不写 points/mask/super_points 的 .bin（仅预览用）
+    interactive_snap_dir: 若目录非空，交互关闭前将 2D 三联图与 Open3D 当前视角保存到该目录
     """
-    fx, fy, cx_k, cy_k = K['fx'], K['fy'], K['cx'], K['cy']
-    H, W = K['height'], K['width']
-
-    rgb      = cv2.cvtColor(cv2.imread(rgb_path), cv2.COLOR_BGR2RGB)
+    rgb = cv2.cvtColor(cv2.imread(rgb_path), cv2.COLOR_BGR2RGB)
     depth_mm = np.load(depth_path).astype(np.float32)
     shapes, ann_W, ann_H = parse_annotation(ann_path)
     H, W = ann_H, ann_W   # 以标注文件中的图像尺寸为准
 
+    # 内参 JSON 常为另一标定分辨率：缩放到 (H,W) 与深度/标注一致，否则 3D 与 2D 投影错位
+    K = dict(K)
+    Ks = _intrinsics_for_image_plane(K, H, W)
+    K['fx'], K['fy'], K['cx'], K['cy'] = Ks['fx'], Ks['fy'], Ks['cx'], Ks['cy']
+    K['height'], K['width'] = H, W
+    fx, fy, cx_k, cy_k = K['fx'], K['fy'], K['cx'], K['cy']
+
+    if rgb.shape[0] != H or rgb.shape[1] != W:
+        rgb = cv2.cvtColor(
+            cv2.resize(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), (W, H), interpolation=cv2.INTER_LINEAR),
+            cv2.COLOR_BGR2RGB,
+        )
+    if depth_mm.shape[0] != H or depth_mm.shape[1] != W:
+        depth_mm = cv2.resize(depth_mm, (W, H), interpolation=cv2.INTER_NEAREST)
+
     # ── 深度增强 ──────────────────────────────────────────────────────────────
     if depth_proc is not None:
-        proc, model = depth_proc
-        depth_use = fuse_depth(depth_mm, rgb, proc, model)
-        print("  [DA2] 深度融合完成，有效像素覆盖率："
+        depth_use = fuse_depth(depth_mm, rgb, depth_proc)
+        tag = 'inpaint' if depth_proc['backend'] == 'guided_inpaint' else 'DA2'
+        print(f"  [{tag}] 深度融合完成，有效像素覆盖率："
               f"原始={((depth_mm>DEPTH_MIN_MM)&(depth_mm<DEPTH_MAX_MM)).mean()*100:.1f}%  "
               f"融合={((depth_use>DEPTH_MIN_MM)&(depth_use<DEPTH_MAX_MM)).mean()*100:.1f}%")
     else:
@@ -397,8 +482,11 @@ def process_frame(rgb_path, depth_path, ann_path, K,
     valid   = (depth_use > DEPTH_MIN_MM) & (depth_use < DEPTH_MAX_MM)
     xyz_img = depth_to_xyz(depth_use, fx, fy, cx_k, cy_k)
     xyzrgb  = np.concatenate([xyz_img, rgb.astype(np.float32)], axis=-1)
-    points  = xyzrgb[valid].astype(np.float32)
-    sp_mask = superpoints_slic(rgb, valid)
+    points = xyzrgb[valid].astype(np.float32)
+    if write_training_data:
+        sp_mask = superpoints_slic(rgb, valid)
+    else:
+        sp_mask = np.zeros(int(valid.sum()), dtype=np.int64)
 
     inst_img = np.full((H, W), -1, dtype=np.int64)
     sem_img  = np.full((H, W), -1, dtype=np.int64)
@@ -428,19 +516,18 @@ def process_frame(rgb_path, depth_path, ann_path, K,
             print(f"    [{label}] 中值深度 {z_med:.1f}m > {MAX_INST_DEPTH}m，跳过")
             continue
 
-        # ── 选择 bbox 生成策略 ────────────────────────────────────────────────
+        # ── bbox：轴对齐紧包 mask 内点云；高覆盖不用多边形扩框以免框大于点云 ──
         if coverage >= COVERAGE_THR:
-            _, bbox = clean_and_bbox(pts3d)
+            bbox = tight_axis_aligned_bbox(pts3d)
             method = f"depth({coverage*100:.0f}%)"
+            min_clip_prior = False
         else:
-            bbox   = prior_bbox(pts3d, poly_mask, label, K)
+            bbox = prior_bbox(pts3d, poly_mask, label, K)
             method = f"prior({coverage*100:.0f}%)"
+            min_clip_prior = True
+            bbox = expand_bbox_by_polygon(bbox, poly_mask, fx, fy)
 
-        # 2D 多边形投影扩框：确保框覆盖完整物体而非仅有深度的局部区域
-        bbox = expand_bbox_by_polygon(bbox, poly_mask, fx, fy)
-
-        # 先验尺寸约束兜底
-        bbox = apply_prior_sanity(bbox, label)
+        bbox = apply_prior_sanity(bbox, label, min_clip=min_clip_prior)
 
         # 最小尺寸过滤
         if bbox[3:6].min() < MIN_BOX_SIZE:
@@ -478,24 +565,35 @@ def process_frame(rgb_path, depth_path, ann_path, K,
             seg_colors[mask] = CLASS_COLORS_RGB.get(name, np.array([.8, .8, .8]))
 
     fname = f'{scene_id}.bin'
-    points.tofile(os.path.join(bins_dir['points'],         fname))
-    inst_mask.tofile(os.path.join(bins_dir['instance_mask'], fname))
-    sem_mask.tofile(os.path.join(bins_dir['semantic_mask'],  fname))
-    sp_mask.tofile(os.path.join(bins_dir['super_points'],    fname))
+    if write_training_data and bins_dir:
+        points.tofile(os.path.join(bins_dir['points'], fname))
+        inst_mask.tofile(os.path.join(bins_dir['instance_mask'], fname))
+        sem_mask.tofile(os.path.join(bins_dir['semantic_mask'], fname))
+        sp_mask.tofile(os.path.join(bins_dir['super_points'], fname))
 
     if vis_dir:
-        _vis_2d(rgb_path, shapes, xyz_img, valid, instances_info, K,
-                os.path.join(vis_dir, f'{scene_id}_2d.jpg'), erode_px)
+        _vis_2d(
+            rgb_path, shapes, xyz_img, valid, instances_info, K,
+            os.path.join(vis_dir, f'{scene_id}_2d.jpg'), erode_px,
+            ann_w=W, ann_h=H,
+        )
         if depth_proc is not None:
+            cap = ('Fused(TELEA+Sensor)' if depth_proc['backend'] == 'guided_inpaint'
+                   else 'Fused(DA2+Sensor)')
             _vis_depth_compare(depth_mm, depth_use,
-                               os.path.join(vis_dir, f'{scene_id}_depth.jpg'))
-        _vis_3d_open3d(points, instances_info,
-                       os.path.join(vis_dir, f'{scene_id}_3d.png'))
+                               os.path.join(vis_dir, f'{scene_id}_depth.jpg'),
+                               right_caption=cap)
+        if vis_3d:
+            _vis_3d_open3d(points, instances_info,
+                           os.path.join(vis_dir, f'{scene_id}_3d.png'))
 
     if interactive:
-        _vis_interactive_combined(rgb, depth_use, shapes,
-                                  points, instances_info, seg_colors,
-                                  scene_id, frame_info)
+        _vis_interactive_combined(
+            rgb, depth_use, shapes,
+            points, instances_info, seg_colors,
+            scene_id, frame_info,
+            snap_dir=interactive_snap_dir,
+        )
 
     return {
         'lidar_points':           {'num_pts_feats': 6, 'lidar_path': fname},
@@ -521,14 +619,44 @@ def _project_corners(bbox, fx, fy, cx, cy):
     return np.stack([u, v], axis=1)
 
 
-def _vis_2d(rgb_path, shapes, xyz_img, valid, instances_info, K, out_path, erode_px):
-    fx, fy, cx, cy = K['fx'], K['fy'], K['cx'], K['cy']
-    H, W = K['height'], K['width']
-    canvas  = cv2.imread(rgb_path)
+def _intrinsics_for_image_plane(K, img_h, img_w):
+    """
+    将内参从 JSON 中标称分辨率 (K['width'], K['height']) 缩放到实际画图分辨率，
+    使 3D 框投影与点云/深度所用相机模型一致，避免 2D 叠框与 3D 框「对不齐」。
+    """
+    kw = float(K.get('width', img_w))
+    kh = float(K.get('height', img_h))
+    sx = img_w / max(kw, 1.0)
+    sy = img_h / max(kh, 1.0)
+    return {
+        'fx': float(K['fx']) * sx,
+        'fy': float(K['fy']) * sy,
+        'cx': float(K['cx']) * sx,
+        'cy': float(K['cy']) * sy,
+        'width': img_w,
+        'height': img_h,
+    }
+
+
+def _vis_2d(rgb_path, shapes, xyz_img, valid, instances_info, K, out_path, erode_px,
+            ann_w=None, ann_h=None):
+    canvas = cv2.imread(rgb_path)
+    if canvas is None:
+        print(f"  [warn] 无法读取 RGB: {rgb_path}")
+        return
+    hi, wi = canvas.shape[:2]
+    Kp = _intrinsics_for_image_plane(K, hi, wi)
+    fx, fy, cx, cy = Kp['fx'], Kp['fy'], Kp['cx'], Kp['cy']
+    H, W = hi, wi
+
+    sx_poly = wi / float(ann_w) if ann_w and ann_w > 0 else 1.0
+    sy_poly = hi / float(ann_h) if ann_h and ann_h > 0 else 1.0
+
     overlay = canvas.copy()
     for shape in shapes:
         c_bgr = (CLASS_COLORS_RGB.get(shape['label'], np.array([.8,.8,.8]))[::-1]*255).astype(int).tolist()
-        pts   = np.array(shape['points'], dtype=np.int32).reshape(-1,1,2)
+        pts = np.array(shape['points'], dtype=np.float32) * np.array([sx_poly, sy_poly])
+        pts = np.round(pts).astype(np.int32).reshape(-1, 1, 2)
         cv2.fillPoly(overlay, [pts], c_bgr)
     canvas = cv2.addWeighted(overlay, 0.28, canvas, 0.72, 0)
 
@@ -553,7 +681,7 @@ def _vis_2d(rgb_path, shapes, xyz_img, valid, instances_info, K, out_path, erode
     print(f"  2D → {out_path}")
 
 
-def _vis_depth_compare(sensor_mm, fused_mm, out_path):
+def _vis_depth_compare(sensor_mm, fused_mm, out_path, right_caption='Fused'):
     """左：传感器深度，右：融合深度，并排保存。"""
     def to_colormap(d_mm):
         d = np.clip(d_mm, DEPTH_MIN_MM, DEPTH_MAX_MM).astype(np.float32)
@@ -563,7 +691,7 @@ def _vis_depth_compare(sensor_mm, fused_mm, out_path):
     right = to_colormap(fused_mm)
     H, W  = left.shape[:2]
     cv2.putText(left,  'Sensor',  (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2)
-    cv2.putText(right, 'Fused(DA2+Sensor)', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2)
+    cv2.putText(right, right_caption[:48], (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2)
     cv2.imwrite(out_path, np.hstack([left, right]))
     print(f"  depth cmp → {out_path}")
 
@@ -601,19 +729,82 @@ def _build_3d_geometries(points, instances_info, seg_colors=None):
     return geoms, ctr, (xext, yext, zext), zmin, pcd_seg_vis
 
 
+def _vis_3d_matplotlib(points, instances_info, out_path, render_w=1280, render_h=960):
+    """Windows 等环境下 Open3D 离屏渲染不可用时，用 matplotlib 保存 3D 预览。"""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points[:, :3])
+    pcd.colors = o3d.utility.Vector3dVector(np.clip(points[:, 3:6] / 255.0, 0, 1))
+    pcd_vis = pcd.voxel_down_sample(0.02)
+    pts = np.asarray(pcd_vis.points)
+    cols = np.asarray(pcd_vis.colors)
+
+    fig = plt.figure(figsize=(render_w / 100.0, render_h / 100.0), facecolor="#1a1a1a")
+    ax = fig.add_subplot(111, projection="3d", facecolor="#1a1a1a")
+    ax.scatter(
+        pts[:, 0], pts[:, 1], pts[:, 2], c=cols, s=1.0, linewidths=0, marker="."
+    )
+    for info in instances_info:
+        color = CLASS_COLORS_RGB.get(info["label"], np.array([0.8, 0.8, 0.8]))
+        c = bbox_corners(np.asarray(info["bbox_3d"], dtype=np.float32))
+        for i, j in EDGES:
+            ax.plot(
+                [c[i, 0], c[j, 0]],
+                [c[i, 1], c[j, 1]],
+                [c[i, 2], c[j, 2]],
+                color=color,
+                linewidth=1.4,
+            )
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    ax.grid(False)
+    ax.tick_params(colors="0.7")
+    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+        try:
+            axis.pane.fill = False
+            axis.pane.set_edgecolor("0.3")
+        except Exception:
+            pass
+        try:
+            axis.label.set_color("0.85")
+        except Exception:
+            pass
+    try:
+        ax.set_box_aspect([1, 1, 1])
+    except Exception:
+        pass
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=100, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    print(f"  3D(matplotlib) → {out_path}")
+
+
 def _vis_3d_open3d(points, instances_info, out_path, render_w=1280, render_h=960):
     geoms, ctr, (xext, yext, zext), zmin, _ = _build_3d_geometries(points, instances_info)
     pcd_vis = geoms[0]
 
-    render = o3d.visualization.rendering.OffscreenRenderer(render_w, render_h)
+    try:
+        render = o3d.visualization.rendering.OffscreenRenderer(render_w, render_h)
+    except (RuntimeError, OSError) as e:
+        print(f"  [warn] Open3D 离屏渲染不可用（{e}）；改用 matplotlib")
+        _vis_3d_matplotlib(points, instances_info, out_path, render_w, render_h)
+        return
+
     render.scene.set_background([0.10, 0.10, 0.10, 1.0])
 
     mat_p = o3d.visualization.rendering.MaterialRecord()
-    mat_p.shader = "defaultUnlit"; mat_p.point_size = 2.0
+    mat_p.shader = "defaultUnlit"
+    mat_p.point_size = 2.0
     render.scene.add_geometry("pcd", pcd_vis, mat_p)
 
     mat_l = o3d.visualization.rendering.MaterialRecord()
-    mat_l.shader = "unlitLine"; mat_l.line_width = 3.0
+    mat_l.shader = "unlitLine"
+    mat_l.line_width = 3.0
     for idx, g in enumerate(geoms[2:]):
         render.scene.add_geometry(f"b{idx}", g, mat_l)
 
@@ -622,14 +813,22 @@ def _vis_3d_open3d(points, instances_info, out_path, render_w=1280, render_h=960
     render.scene.add_geometry("axes", geoms[1], mat_a)
 
     pull = max(zext * 0.8, 1.5)
-    eye  = np.array([ctr[0] + xext*0.2, ctr[1] - yext*0.6, zmin - pull])
-    render.scene.camera.look_at(ctr.tolist(), eye.tolist(), [0., -1., 0.])
+    eye = np.array([ctr[0] + xext * 0.2, ctr[1] - yext * 0.6, zmin - pull])
+    render.scene.camera.look_at(ctr.tolist(), eye.tolist(), [0.0, -1.0, 0.0])
     render.scene.camera.set_projection(
-        55., render_w / render_h, 0.05, 200.,
-        o3d.visualization.rendering.Camera.FovType.Vertical)
+        55.0,
+        render_w / render_h,
+        0.05,
+        200.0,
+        o3d.visualization.rendering.Camera.FovType.Vertical,
+    )
 
-    o3d.io.write_image(out_path, render.render_to_image())
-    print(f"  3D  → {out_path}")
+    try:
+        o3d.io.write_image(out_path, render.render_to_image())
+        print(f"  3D  → {out_path}")
+    except (RuntimeError, OSError) as e:
+        print(f"  [warn] Open3D render_to_image 失败（{e}）；改用 matplotlib")
+        _vis_3d_matplotlib(points, instances_info, out_path, render_w, render_h)
 
 
 def _build_2d_panel(rgb, depth_use, shapes, panel_h=540):
@@ -686,13 +885,16 @@ def _build_2d_panel(rgb, depth_use, shapes, panel_h=540):
 
 
 def _vis_interactive_combined(rgb, depth_use, shapes,
-                               points, instances_info, seg_colors,
-                               scene_id, frame_info):
+                              points, instances_info, seg_colors,
+                              scene_id, frame_info,
+                              snap_dir=None):
     """
     同时展示：
       • OpenCV 窗口 — 原始图 | 深度伪彩 | 分割 Mask（三格横排）
       • Open3D 窗口 — 点云 + 3D 检测框（可交互旋转/缩放）
     关闭 Open3D 窗口或按 Q / ESC 后继续下一帧。
+    若 ``snap_dir`` 非空，在退出前保存两窗口用于展示：
+      ``{scene_id}_interactive_2d.jpg``、``{scene_id}_interactive_3d.jpg``。
     """
     # ── 2D 面板 ───────────────────────────────────────────────────────────────
     panel = _build_2d_panel(rgb, depth_use, shapes)
@@ -742,7 +944,8 @@ def _vis_interactive_combined(rgb, depth_use, shapes,
     opt.background_color = np.array([0.10, 0.10, 0.10])
     opt.point_size = 2.0
 
-    print(f"  [交互] 左=原始RGB点云  右=语义分割着色点云  关闭或按 Q/ESC 继续下一帧 ...")
+    print("  [交互] 左=原始RGB点云  右=语义分割着色点云  关闭或按 Q/ESC 继续下一帧；"
+          "退出前保存展示图（若已指定保存目录）…")
     while True:
         if not vis.poll_events():
             break
@@ -750,6 +953,25 @@ def _vis_interactive_combined(rgb, depth_use, shapes,
         key = cv2.waitKey(1) & 0xFF
         if key in (ord('q'), ord('Q'), 27):
             break
+
+    if snap_dir:
+        os.makedirs(snap_dir, exist_ok=True)
+        p2d = os.path.join(snap_dir, f'{scene_id}_interactive_2d.jpg')
+        cv2.imwrite(p2d, panel)
+        p3d = os.path.join(snap_dir, f'{scene_id}_interactive_3d.jpg')
+        try:
+            vis.update_renderer()
+            buf = vis.capture_screen_float_buffer(do_render=True)
+            arr = np.asarray(buf)
+            if arr.ndim == 3 and arr.shape[2] >= 3:
+                u8 = (np.clip(arr[:, :, :3], 0.0, 1.0) * 255.0).astype(np.uint8)
+                bgr = cv2.cvtColor(u8, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(p3d, bgr)
+                print(f"  [交互展示图] {p2d}\n               {p3d}")
+            else:
+                print(f"  [warn] Open3D 截图格式异常，仅保存 2D: {p2d}")
+        except Exception as e:
+            print(f"  [warn] Open3D 截图失败（已保存 2D）: {e}\n         {p2d}")
 
     vis.destroy_window()
     cv2.destroyWindow(win2d)
@@ -827,37 +1049,84 @@ def main():
 
     # ── 公共选项 ──────────────────────────────────────────────────────────────
     parser.add_argument('--out-dir',    default='data/custom')
-    parser.add_argument('--vis-dir',    default='results/custom_vis')
+    parser.add_argument(
+        '--vis-dir',
+        nargs='?',
+        const='results/custom_vis',
+        default='results/custom_vis',
+        metavar='DIR',
+        help='可视化输出目录；可只写 --vis-dir（不加路径）则使用默认 results/custom_vis；'
+             '写 --vis-dir 某路径则保存到该目录；用 --no-vis 关闭可视化',
+    )
+    parser.add_argument('--no-vis', action='store_true',
+                        help='不保存 2D/深度对比/3D 预览图')
     parser.add_argument('--val-ratio',  type=float, default=0.2)
     parser.add_argument('--erode-px',   type=int,   default=2)
     parser.add_argument('--interactive', action='store_true',
                         help='每帧处理完后弹出 Open3D 交互窗口，关闭后继续下一帧')
-    parser.add_argument('--no-da2',     action='store_true',
-                        help='跳过 Depth Anything V2，只用传感器深度')
-    parser.add_argument('--device',       default='cuda:0')
+    parser.add_argument('--interactive-only', action='store_true',
+                        help='仅交互预览：不写 out-dir 下 bin 与 custom_infos pkl，不写默认可视化；'
+                             '隐含开启 --interactive。若仍要落盘 2D/深度/3D 图请再加 --vis-dir')
+    parser.add_argument('--no-interactive-snap', action='store_true',
+                        help='交互模式下不保存两窗口展示图（默认会保存）')
+    parser.add_argument('--no-vis-3d', action='store_true',
+                        help='不生成离线 3D 预览（*_3d.png）；2D/深度对比仍会输出')
+    parser.add_argument(
+        '--depth-backend',
+        choices=['guided_inpaint', 'da2'],
+        default='guided_inpaint',
+        help='深度补全：guided_inpaint=TELEA+双边（无模型）；da2=Depth Anything V2（需 HF/torch）',
+    )
+    parser.add_argument('--no-da2', action='store_true',
+                        help='不做深度补全，仅原始传感器深度（关闭所有 depth-backend）')
+    parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--label-config', default=_DEFAULT_LABEL_CONFIG,
                         help='标签配置 YAML 文件路径')
     args = parser.parse_args()
+
+    if args.interactive_only:
+        args.interactive = True
+        if '--vis-dir' not in sys.argv:
+            args.vis_dir = None
+
+    if args.no_vis:
+        args.vis_dir = None
 
     load_label_config(args.label_config)
 
     rgb_dir, ann_dir, depth_dir, intrinsics_path = _resolve_dirs(args)
     print(f"[数据目录] rgb={rgb_dir}  ann={ann_dir}  depth={depth_dir}")
 
-    with open(intrinsics_path) as f:
+    with open(intrinsics_path, encoding="utf-8") as f:
         K = json.load(f)
     K['height'] = int(K.get('height', 480))
     K['width']  = int(K.get('width',  640))
 
+    write_training_data = not args.interactive_only
     bins_dir = {}
-    for sub in ['points', 'instance_mask', 'semantic_mask', 'super_points']:
-        p = os.path.join(args.out_dir, sub)
-        os.makedirs(p, exist_ok=True)
-        bins_dir[sub] = p
+    if write_training_data:
+        for sub in ['points', 'instance_mask', 'semantic_mask', 'super_points']:
+            p = os.path.join(args.out_dir, sub)
+            os.makedirs(p, exist_ok=True)
+            bins_dir[sub] = p
     if args.vis_dir:
         os.makedirs(args.vis_dir, exist_ok=True)
 
-    depth_proc = None if args.no_da2 else load_depth_model(args.device)
+    want_interactive = bool(args.interactive or args.interactive_only)
+    interactive_snap_dir = None
+    if want_interactive and not args.no_interactive_snap:
+        interactive_snap_dir = (
+            args.vis_dir if args.vis_dir else os.path.join(args.out_dir, 'interactive_snaps')
+        )
+        os.makedirs(interactive_snap_dir, exist_ok=True)
+
+    depth_proc = None
+    if not args.no_da2:
+        if args.depth_backend == 'guided_inpaint':
+            print("[深度] 使用 guided_inpaint（TELEA 空洞填补 + 双边，无神经网络）")
+            depth_proc = {'backend': 'guided_inpaint'}
+        else:
+            depth_proc = load_depth_model_da2(args.device)
 
     ann_files = sorted(glob.glob(os.path.join(ann_dir, '*.json')))
     if not ann_files:
@@ -890,13 +1159,22 @@ def main():
                              erode_px=args.erode_px,
                              depth_proc=depth_proc,
                              interactive=args.interactive,
-                             frame_info=frame_info)
-        all_infos.append(info)
+                             frame_info=frame_info,
+                             vis_3d=not args.no_vis_3d,
+                             write_training_data=write_training_data,
+                             interactive_snap_dir=interactive_snap_dir)
+        if write_training_data:
+            all_infos.append(info)
 
-    n_val = max(1, int(len(all_infos) * args.val_ratio))
-    write_pkl(all_infos[:-n_val], os.path.join(args.out_dir, 'custom_infos_train.pkl'))
-    write_pkl(all_infos[-n_val:], os.path.join(args.out_dir, 'custom_infos_val.pkl'))
-    print(f"\n完成！train={len(all_infos)-n_val}  val={n_val}")
+    if write_training_data and all_infos:
+        n_val = max(1, int(len(all_infos) * args.val_ratio))
+        write_pkl(all_infos[:-n_val], os.path.join(args.out_dir, 'custom_infos_train.pkl'))
+        write_pkl(all_infos[-n_val:], os.path.join(args.out_dir, 'custom_infos_val.pkl'))
+        print(f"\n完成！train={len(all_infos)-n_val}  val={n_val}")
+    elif args.interactive_only:
+        print("\n[interactive-only] 已结束：未写入 bin / pkl（未指定 --vis-dir 时也未写预览图）。")
+    else:
+        print("\n完成：无有效帧，未生成 pkl。")
 
 
 if __name__ == '__main__':
